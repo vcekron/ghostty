@@ -1,0 +1,60 @@
+name: qtfocus-sync
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+    inputs:
+      rehearse:
+        description: Push a throwaway rewritten commit to check SYNC_TOKEN, then delete it
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: qtfocus
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Keep schedule enabled
+        run: gh workflow enable qtfocus-sync.yml -R "$GITHUB_REPOSITORY"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/ghostty-org/ghostty.git
+
+      - name: Rehearse push
+        if: inputs.rehearse
+        run: |
+          git commit --amend --no-edit --date=now
+          git push origin HEAD:refs/heads/qtfocus-rehearsal
+          git push origin --delete qtfocus-rehearsal
+          git reset --hard origin/qtfocus
+
+      - name: Rebase onto latest upstream release
+        run: |
+          latest=$(git ls-remote --tags upstream \
+            | sed -nE 's#.*refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | sort -V | tail -1)
+          base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' HEAD)
+          echo "upstream: $latest, qtfocus based on: $base"
+          if [ "$(printf '%s\n' "$base" "$latest" | sort -V | tail -1)" != "$base" ]; then
+            git fetch --quiet upstream "refs/tags/$latest:refs/tags/$latest"
+            git rebase --onto "$latest" "$base" qtfocus
+            git push --force-with-lease origin qtfocus
+            base=$latest
+          fi
+          if [ -z "$(git ls-remote --tags origin "refs/tags/$base-qtfocus.*")" ]; then
+            git tag -a "$base-qtfocus.1" -m "Ghostty ${base#v} with quick terminal focus fix"
+            git push origin "$base-qtfocus.1"
+          fi

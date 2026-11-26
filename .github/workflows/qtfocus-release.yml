@@ -1,0 +1,114 @@
+name: qtfocus-release
+
+on:
+  push:
+    tags:
+      - "v*-qtfocus.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      CERTIFICATE_NAME: vcekron Code Signing
+      APP: macos/build/Release/Ghostty.app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+
+      - name: Install build tools
+        run: brew install pandoc gettext
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          xcodebuild -version
+
+      - name: Read version
+        id: version
+        run: echo "ghostty=$(sed -nE 's/^ *\.version = "(.*)",$/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      - name: Build GhosttyKit
+        run: |
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
+            -Demit-docs=true \
+            -Dversion-string=${{ steps.version.outputs.ghostty }}
+
+      - name: Build Ghostty.app
+        working-directory: macos
+        run: xcodebuild -target Ghostty -configuration Release
+
+      - name: Update Info.plist
+        run: |
+          plist="$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :GhosttyCommit $(git rev-parse --short HEAD)" "$plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" "$plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.ghostty }}" "$plist"
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          keychain_pwd=$(openssl rand -hex 24)
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_pwd" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$keychain_pwd" build.keychain
+          security import "$RUNNER_TEMP/certificate.p12" -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_pwd" build.keychain
+          rm "$RUNNER_TEMP/certificate.p12"
+          security find-certificate -c "$CERTIFICATE_NAME" -p build.keychain > "$RUNNER_TEMP/certificate.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$RUNNER_TEMP/certificate.pem"
+          security find-identity -v -p codesigning build.keychain
+
+      - name: Codesign app bundle
+        run: |
+          sign() { /usr/bin/codesign --verbose -f -s "$CERTIFICATE_NAME" -o runtime "$@"; }
+          sparkle="$APP/Contents/Frameworks/Sparkle.framework"
+          sign "$sparkle/Versions/B/XPCServices/Downloader.xpc"
+          sign "$sparkle/Versions/B/XPCServices/Installer.xpc"
+          sign "$sparkle/Versions/B/Autoupdate"
+          sign "$sparkle/Versions/B/Updater.app"
+          sign "$sparkle"
+          sign "$APP/Contents/PlugIns/DockTilePlugin.plugin"
+          entitlements="$RUNNER_TEMP/Ghostty.entitlements"
+          cp macos/Ghostty.entitlements "$entitlements"
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.disable-library-validation bool true" "$entitlements"
+          sign --entitlements "$entitlements" "$APP"
+
+      - name: Verify app bundle
+        run: |
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+          /usr/bin/codesign -d -r- "$APP"
+          /usr/bin/codesign -d --entitlements - "$APP" | grep -q com.apple.security.cs.disable-library-validation
+          ls "$APP/Contents/Resources/man/man1/ghostty.1" "$APP/Contents/Resources/man/man5/ghostty.5"
+          ls "$APP/Contents/Resources/zsh/site-functions/_ghostty"
+          "$APP/Contents/MacOS/ghostty" +version
+
+      - name: Zip app bundle
+        run: ditto -c -k --keepParent "$APP" Ghostty.zip
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Ghostty
+          path: Ghostty.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" Ghostty.zip \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Ghostty ${{ steps.version.outputs.ghostty }} with the quick terminal restoring focus to the most recently active app."

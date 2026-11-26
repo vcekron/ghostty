@@ -13,7 +13,7 @@ class QuickTerminalController: BaseTerminalController {
     /// The current state of the quick terminal
     private(set) var visible: Bool = false
 
-    /// The previously running application when the terminal is shown. This is NEVER Ghostty.
+    /// The most recently active application while the terminal is shown. This is NEVER Ghostty.
     /// If this is set then when the quick terminal is animated out then we will restore this
     /// application to the front.
     private var previousApp: NSRunningApplication?
@@ -91,6 +91,11 @@ class QuickTerminalController: BaseTerminalController {
             selector: #selector(windowDidResize(_:)),
             name: NSWindow.didResizeNotification,
             object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidActivateApplication(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil)
     }
 
     required init?(coder: NSCoder) {
@@ -101,6 +106,7 @@ class QuickTerminalController: BaseTerminalController {
         // Remove all of our notificationcenter subscriptions
         let center = NotificationCenter.default
         center.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
 
         // Make sure we restore our hidden dock
         hiddenDock = nil
@@ -676,6 +682,13 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     // MARK: Notifications
+
+    @objc private func workspaceDidActivateApplication(_ notification: Notification) {
+        guard visible,
+              let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+        previousApp = app
+    }
 
     @objc private func applicationWillTerminate(_ notification: Notification) {
         // If the application is going to terminate we want to make sure we
